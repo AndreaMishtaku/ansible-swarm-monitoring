@@ -1,0 +1,73 @@
+---
+# tasks file for roles/nfs
+
+# Installation of the NFS server package (nfs-kernel-server) on nodes designated as NFS servers
+- name: Install server package
+  ansible.builtin.apt:
+    pkg:
+      - nfs-kernel-server
+    update_cache: true
+  when: inventory_hostname in groups['nfs_server']
+  become: true
+
+# Installation of the  the NFS client package (nfs-common) on nodes designated as NFS clients
+- name: Install client package
+  ansible.builtin.apt:
+    pkg:
+      - nfs-common
+    update_cache: true
+  when: inventory_hostname in groups['nfs_client']
+  become: true
+
+# Starts the NFS server service on nodes designated as NFS servers
+- name: enable nfs server
+  ansible.builtin.service:
+    name: nfs-kernel-server
+    state: started
+  when: inventory_hostname in groups['nfs_server']
+  become: true
+
+# Creation of the shared /data directory: Creates a shared directory at /data with permissions set to 0777(read, write, execute)
+- name: Create the shared /data directory
+  ansible.builtin.file:
+    path: /data
+    state: directory
+    mode: "0777"
+  become: true
+
+# Configuration of the NFS server to share the /data directory with specified client nodes
+- name: Export /data directory in nfs server
+  lineinfile:
+    path: /etc/exports
+    state: present
+    line: "/data {{ hostvars[groups['nfs_client'][0]].ansible_eth1.ipv4.address }}(rw,no_root_squash,no_subtree_check)"
+  when: inventory_hostname in groups['nfs_server']
+  become: true
+# We can add loop here to iterate to multiple  but in our case is only one
+# loop: "{{ groups['nfs_client'] }}"
+
+# Updates the /etc/fstab file on client nodes to mount the NFS shared directory
+- name: Update fstab to mount /data in nfs client
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    state: present
+    line: "{{ hostvars[groups['nfs_server'][0]].ansible_eth1.ipv4.address }}:/data /data nfs defaults 0 0"
+  when: inventory_hostname in groups['nfs_client']
+  become: true
+
+# Reloads the NFS exports on the server to apply the new export configuration
+- name: Reload exportfs
+  ansible.builtin.command: exportfs -var
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+  changed_when: false
+
+# Mounts the NFS shared directory on the client nodes.
+- name: Mount /data on nfs client
+  ansible.posix.mount:
+    path: /data
+    state: mounted
+    fstype: nfs
+    src: "{{ hostvars[groups['nfs_server'][0]].ansible_eth1.ipv4.address }}:/data"
+  when: inventory_hostname in groups['nfs_client']
+  become: true

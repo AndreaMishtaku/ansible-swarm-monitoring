@@ -1,0 +1,12 @@
+---
+# defaults file for roles/swarm-services
+swarm_force_reset_all_services: true
+swarm_services_data_dirs:
+  - name: forgejo
+  - name: forgejo/gitea/data/tmp/package-upload
+  - name: grafana
+  - name: loki
+  - name: prometheus
+  - name: postgres
+  - name: traefik
+  - name: traefik-certs

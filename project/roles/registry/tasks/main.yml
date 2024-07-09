@@ -1,0 +1,216 @@
+---
+# tasks file for roles/registry
+
+# Installation of apache2-utils package
+- name: Install apache2-utils for htpasswd
+  ansible.builtin.apt:
+    pkg:
+      - apache2-utils
+    update_cache: true
+  become: true
+
+# Addition of an entry to the /etc/hosts file for the registry
+- name: create entry in '/etc/hosts' for registry
+  lineinfile:
+    path: /etc/hosts
+    state: present
+    line: "127.0.0.1 {{ registry_name }}"
+  become: yes
+
+# Creation of a shared directory for registry data with full permissions
+- name: Create the shared /data/registry directory
+  ansible.builtin.file:
+    path: /data/registry
+    state: directory
+    mode: "0777"
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+# Creation of a subdirectory for storing registry certificates with full permissions
+- name: Create the shared /data/registry/cert directory
+  ansible.builtin.file:
+    path: /data/registry/cert
+    state: directory
+    mode: "0777"
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+# Generates a private key  for the registry
+- name: Create private key (RSA, 4096 bits)
+  community.crypto.openssl_privatekey:
+    path: /data/registry/cert/registry.key
+    type: RSA
+    size: 4096
+    mode: "0400"
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+# Creates a certificate signing request (CSR) using the generated private key
+- name: Create certificate signing request for self-signed certificate
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: /data/registry/cert/registry.key
+    common_name: "{{ registry_name }}"
+    organization_name: "Virtualization and Cloud Computing"
+  register: csr
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+# Generate a self-signed certificate using the CSR
+- name: Create self-signed certificate
+  community.crypto.x509_certificate:
+    path: /data/registry/cert/registry.pem
+    privatekey_path: /data/registry/cert/registry.key
+    provider: "selfsigned"
+    csr_content: "{{ csr.csr }}"
+    mode: "0600"
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+# Installs the passlib library required for creating bcrypt encrypted passwords
+- name: Install passlib
+  ansible.builtin.apt:
+    name: python3-passlib
+    state: present
+    update_cache: true
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+# Create an htpasswd file with bcrypt encrypted password for registry authentication
+- name: Create registry htpasswd
+  community.general.htpasswd:
+    path: /data/registry/htpasswd
+    name: "{{ registry_username }}"
+    password: "{{ registry_password }}"
+    crypt_scheme: bcrypt
+    mode: "0644"
+  become: true
+  when: inventory_hostname in groups['nfs_server']
+
+- name: Config for registry proxy cache
+  set_fact:
+    proxy_config: "{{ config | to_nice_yaml }}"
+  vars:
+    config:
+      version: 0.1
+      log:
+        fields:
+          service: registry
+      storage:
+        cache:
+          blobdescriptor: inmemory
+        filesystem:
+          rootdirectory: /var/lib/registry
+      http:
+        addr: 127.0.0.1:5001
+        headers:
+          X-Content-Type-Options: [nosniff]
+      health:
+        storagedriver:
+          enabled: true
+          interval: 10s
+          threshold: 3
+      delete:
+        enabled: true
+      proxy:
+        remoteurl: https://registry-1.docker.io
+
+- name: Copy using inline content
+  ansible.builtin.copy:
+    content: "{{ proxy_config }}"
+    dest: /data/registry/config.yml
+  become: yes
+  when: inventory_hostname in groups['nfs_server']
+
+- name: Config for registry proxy in docker daemon
+  set_fact:
+    docker_daemon: "{{ config | to_nice_json }}"
+  vars:
+    config:
+      registry-mirrors:
+        - http://127.0.0.1:5001
+      insecure-registries:
+        - 127.0.0.1:5001
+
+- name: Copy using inline content
+  ansible.builtin.copy:
+    content: "{{ docker_daemon }}"
+    dest: /etc/docker/daemon.json
+  become: yes
+
+- name: Restart dockerd
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+  become: yes
+
+- name: Run registry for cache
+  docker_swarm_service:
+    name: registry-cache
+    image: registry:2.8.3
+    mode: global
+    mounts:
+      - source: /data/registry
+        target: /var/lib/registry
+        type: bind
+      - source: /data/registry/config.yml
+        target: /etc/docker/registry/config.yml
+        type: bind
+    networks:
+      - host
+  when: inventory_hostname in groups['swarm_manager']
+
+# sets up a Docker Swarm service named "registry" with global mode, TLS encryption, htpasswd authentication, Prometheus metrics enabled,
+# and debug endpoints, limited to hosts in the "swarm_manager" group
+- name: Run registry
+  docker_swarm_service:
+    name: registry
+    image: registry:2.8.3
+    mode: global
+    mounts:
+      - source: /data/registry
+        target: /var/lib/registry
+        type: bind
+      - source: /data/registry/cert
+        target: /cert
+        type: bind
+      - source: /data/registry/htpasswd
+        target: /htpasswd
+        type: bind
+    networks:
+      - host
+    restart_config:
+      condition: on-failure
+    tls: true
+    env:
+      REGISTRY_HTTP_TLS_CERTIFICATE: /cert/registry.pem
+      REGISTRY_HTTP_TLS_KEY: /cert/registry.key
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_PATH: /htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Realm"
+      REGISTRY_METRICS_ENABLED: "true"  # Enable Prometheus metrics
+      REGISTRY_METRICS_PATH: /metrics  # Define the metrics endpoint path
+      REGISTRY_HTTP_DEBUG_ADDR: "0.0.0.0:5091"
+    labels:
+      prometheus.enable: "true"
+      prometheus.job: "registry"
+      prometheus.metrics.port: "5091"
+      prometheus.metrics.path: "/metrics"
+  when: inventory_hostname in groups['swarm_manager']
+
+- name: Wait for port 5000
+  ansible.builtin.wait_for:
+    port: 5000
+    delay: 5
+
+- name: Log into private registry
+  docker_swarm_service:
+    name: registry
+    image: registry:2
+    mode: global
+    mounts:
+      - source: /data/registry
+        target: /var/lib/registry
+        type: bind
+    networks:
+      - host
+  when: inventory_hostname in groups['swarm_manager']

@@ -1,0 +1,5 @@
+---
+# defaults file for roles/registry
+registry_name: registry.vcc.local
+registry_port: 5000
+
